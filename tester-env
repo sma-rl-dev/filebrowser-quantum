@@ -27,7 +27,8 @@ TESTER_ENV_APP="${TESTER_ENV_APP:-filebrowser-quantum}"
 TESTER_ENV_SCENARIO="${TESTER_ENV_SCENARIO:-manual}"
 ADMIN_USER="${ADMIN_USER:-admin}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-tester-env-admin}"
-BASE_URL="${BASE_URL:-${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}}"
+# Resolved after flag parsing so --port is reflected; operator env wins.
+BASE_URL="${BASE_URL:-${TESTER_ENV_BROWSER_ORIGIN:-}}"
 
 refresh_names() {
     local suffix=""
@@ -576,7 +577,7 @@ main() {
         esac
     done
 
-    BASE_URL="${BASE_URL:-${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}}"
+    BASE_URL="${BASE_URL:-http://localhost:${PORT}}"
     refresh_names
 
     case "${cmd}" in
