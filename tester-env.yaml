@@ -1,0 +1,28 @@
+# Deterministic tester-env config for FileBrowser Quantum.
+# Baked into the image at /home/filebrowser/config/config.yaml.
+# Reset removes the container and the /data volume only, so a fresh boot
+# recreates the sqlite schema and this same admin from scratch.
+http:
+  port: 80
+  baseURL: "/"
+
+server:
+  disableUpdateCheck: true
+  cacheDir: "/data/cache"
+  database:
+    path: "/data/database.sqlite"
+  sources:
+    - path: "/data/files"
+      name: "files"
+      config:
+        defaultEnabled: true
+
+auth:
+  adminUsername: "admin"
+  # Fixed so reset -> deploy returns the same login. FILEBROWSER_ADMIN_PASSWORD
+  # can override it at run time; "admin" is ignored by the reset path.
+  adminPassword: "tester-env-admin"
+  key: "tester-env-jwt-hmac-key-0123456789abcdef0123456789abcdef"
+
+frontend:
+  name: "FileBrowser Quantum"

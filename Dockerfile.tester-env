@@ -1,0 +1,96 @@
+# Tester-env build for FileBrowser Quantum (v2.0.2-stable).
+#
+# Derived from _docker/Dockerfile with four deliberate changes:
+#   1. every base image is pinned by tag + manifest digest (upstream floats
+#      golang:alpine / node:jod-slim / alpine:latest);
+#   2. the `analytics` build tag is dropped, so publish_stub.go compiles and
+#      no events are POSTed to api.filebrowserquantum.com;
+#   3. Go module, go-fitz header and npm layers come before the source copy,
+#      and go/npm caches are BuildKit cache mounts, so a source mutation only
+#      re-runs the affected build step;
+#   4. the Vite output is copied to ./internal/web/dist in the runtime image.
+#      backend/cmd/root.go serves that directory when it exists; the embed/
+#      fallback is empty in this checkout and would render a blank SPA.
+#
+# Preview support (ffmpeg stage + `mupdf` tag) is kept, matching upstream.
+
+FROM ghcr.io/gtsteffaniak/ffmpeg:9.0.2-decode@sha256:163716e8d9d27949cf10a39d5d79b0d0fc4a543cf1701f2d98a1fd927e6f0683 AS ffmpeg
+
+FROM golang:1.27.4-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS gobuild
+
+ARG VERSION=2.0.2-stable
+ARG REVISION=2c071d1e6eb48d4b88da2657885d345663a0a88b
+
+RUN apk add --no-cache gcc musl-dev git ca-certificates
+
+WORKDIR /app
+ENV CGO_ENABLED=1 \
+    GOCACHE=/root/.cache/go-build \
+    GOMODCACHE=/root/.cache/go-mod
+
+COPY backend/go.mod backend/go.sum ./
+RUN --mount=type=cache,id=fbq-gomod,target=/root/.cache/go-mod \
+    --mount=type=cache,id=fbq-gocache,target=/root/.cache/go-build \
+    go mod download
+
+# The header script symlinks into internal/preview, so that directory has to
+# exist before the source layer lands. Only preview changes re-run this step.
+COPY backend/scripts/setup-gofitz-cgo ./scripts/setup-gofitz-cgo
+COPY backend/internal/preview/ ./internal/preview/
+RUN --mount=type=cache,id=fbq-gomod,target=/root/.cache/go-mod \
+    --mount=type=cache,id=fbq-gocache,target=/root/.cache/go-build \
+    go run ./scripts/setup-gofitz-cgo
+
+COPY backend/ ./
+RUN --mount=type=cache,id=fbq-gomod,target=/root/.cache/go-mod \
+    --mount=type=cache,id=fbq-gocache,target=/root/.cache/go-build \
+    go build -trimpath -buildvcs=false -tags mupdf,musl -ldflags="-w -s \
+      -X 'github.com/gtsteffaniak/filebrowser/backend/internal/version.Version=${VERSION}' \
+      -X 'github.com/gtsteffaniak/filebrowser/backend/internal/version.CommitSHA=${REVISION}'" \
+      -o filebrowser .
+
+FROM node:jod-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS frontend
+
+WORKDIR /build/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && git config --global url."https://github.com/".insteadOf "git@github.com:" \
+    && git config --global url."https://github.com/".insteadOf "ssh://git@github.com:"
+RUN --mount=type=cache,id=fbq-npm,target=/root/.npm npm ci
+COPY frontend/ ./
+# vite outDir is ../backend/internal/web/dist
+RUN npm run build:docker
+
+FROM alpine:3.23@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2
+
+COPY --from=ffmpeg [ "/ffmpeg", "/ffprobe", "/usr/local/bin/" ]
+ENV FILEBROWSER_FFMPEG_PATH="/usr/local/bin/" \
+    FILEBROWSER_DATABASE_PATH="/data/database.sqlite" \
+    FILEBROWSER_CONFIG="/home/filebrowser/config/config.yaml" \
+    PATH="$PATH:/home/filebrowser"
+
+RUN apk --no-cache add ca-certificates mailcap tzdata curl \
+    && adduser -D -s /bin/true -u 1000 filebrowser
+
+WORKDIR /home/filebrowser
+COPY --from=gobuild --chown=filebrowser:1000 [ "/app/filebrowser", "./" ]
+COPY --from=gobuild --chown=filebrowser:1000 [ "/app/reduce-rounded-corners.css", "./" ]
+COPY --chown=filebrowser:1000 tester-env.yaml ./config/config.yaml
+COPY --from=frontend --chown=filebrowser:1000 [ "/build/backend/internal/web/dist/", "./internal/web/dist/" ]
+
+# /data is the mounted volume; creating it here gives the volume uid 1000.
+# Seed data is written by `tester-env seed`, not baked into the image.
+RUN mkdir -p /data/files /data/cache \
+    && chown -R filebrowser:1000 /data
+
+USER filebrowser
+
+## sanity checks
+RUN [ "filebrowser", "version" ]
+RUN [ "ffmpeg", "-version" ]
+RUN [ "ffprobe", "-version" ]
+
+EXPOSE 80
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
+  CMD curl -f http://localhost:80/health || exit 1
+ENTRYPOINT [ "./filebrowser" ]

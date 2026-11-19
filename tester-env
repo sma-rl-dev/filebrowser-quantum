@@ -1,0 +1,595 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# filebrowser-quantum - Tester Environment CLI
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+# Commands: deploy, seed, verify, reset, stop, logs, status, help
+#
+# Builds from editable source via Dockerfile.tester-env in this directory
+# (ffmpeg stage -> golang:1.27.4-alpine CGO mupdf -> node:jod-slim vite ->
+# alpine:3.23 runtime), never from a prebuilt image. The deterministic config
+# is tester-env.yaml, baked into the image at /home/filebrowser/config/config.yaml.
+#
+# Runtime: single container, sqlite + cache + files under /data (named volume).
+# Reset = remove the container and the volume, so reset -> deploy -> seed is the
+# reproducible path. Seed installs a business shared-drive tree (fixed names,
+# sizes and mtimes), three standard users via the app CLI and one share via the
+# API, replacing all mutable state so a re-seed returns the same visible data.
+# Previews (ffmpeg/mupdf) stay enabled; the analytics build tag is dropped and
+# server.disableUpdateCheck is set, so the container makes no telemetry or
+# GitHub tag calls.
+
+RUN_ID="${RUN_ID:-default}"
+PORT="${PORT:-18078}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TESTER_ENV_PROJECT="${TESTER_ENV_PROJECT:-tester-env}"
+TESTER_ENV_APP="${TESTER_ENV_APP:-filebrowser-quantum}"
+TESTER_ENV_SCENARIO="${TESTER_ENV_SCENARIO:-manual}"
+ADMIN_USER="${ADMIN_USER:-admin}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-tester-env-admin}"
+BASE_URL="${BASE_URL:-${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}}"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+
+    CONTAINER_NAME="tester-env-filebrowser-quantum${suffix}"
+    DATA_VOLUME="filebrowser-quantum-data${suffix}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-filebrowser-quantum:dev}"
+}
+
+labels() {
+    echo --label "tester-env.project=${TESTER_ENV_PROJECT}"
+    echo --label "tester-env.app=${TESTER_ENV_APP}"
+    echo --label "tester-env.scenario=${TESTER_ENV_SCENARIO}"
+}
+
+running() {
+    docker ps --filter "name=${CONTAINER_NAME}" --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"
+}
+
+api_login() {
+    # Login is POST /api/auth/login?username=<user> with the URL-encoded
+    # password in the X-Password header; the response body is the raw JWT.
+    local encoded
+    encoded="$(printf '%s' "${ADMIN_PASSWORD}" | jq -sRr @uri)"
+    curl -fsS -X POST \
+        "http://localhost:${PORT}/api/auth/login?username=${ADMIN_USER}" \
+        -H "X-Password: ${encoded}"
+}
+
+cmd_wait_ready() {
+    local i
+    for i in $(seq 1 60); do
+        if curl -fsS "http://localhost:${PORT}/health" 2>/dev/null | grep -q '"ok"'; then
+            if [[ -n "$(api_login 2>/dev/null)" ]]; then
+                return 0
+            fi
+        fi
+        if ! running; then
+            echo "ERROR: container exited during startup."
+            docker logs "${CONTAINER_NAME}" 2>&1 | tail -40 || true
+            exit 1
+        fi
+        sleep 2
+    done
+
+    echo "ERROR: FileBrowser Quantum did not become ready in time."
+    docker logs "${CONTAINER_NAME}" 2>&1 | tail -40 || true
+    exit 1
+}
+
+cmd_deploy() {
+    echo "==> Resetting any previous run (${RUN_ID})..."
+    cmd_reset_inner
+
+    echo "==> Building image from source (${IMAGE_NAME})..."
+    docker build \
+        $(labels) \
+        -f "${SCRIPT_DIR}/Dockerfile.tester-env" \
+        -t "${IMAGE_NAME}" \
+        "${SCRIPT_DIR}"
+
+    echo "==> Creating volume ${DATA_VOLUME} (reuse if present)..."
+    docker volume inspect "${DATA_VOLUME}" >/dev/null 2>&1 || docker volume create \
+        $(labels) "${DATA_VOLUME}" >/dev/null
+
+    echo "==> Starting FileBrowser Quantum on port ${PORT}..."
+    docker run -d --name "${CONTAINER_NAME}" \
+        $(labels) \
+        -p "${PORT}:80" \
+        -v "${DATA_VOLUME}:/data" \
+        -e FILEBROWSER_ADMIN_PASSWORD="${ADMIN_PASSWORD}" \
+        "${IMAGE_NAME}" >/dev/null
+
+    echo "==> Waiting for FileBrowser Quantum (health + login)..."
+    cmd_wait_ready
+
+    echo "==> Deployment complete. App running at ${BASE_URL}"
+    echo "==> Login: ${ADMIN_USER} / ${ADMIN_PASSWORD}"
+}
+
+SEED_SHARE_TITLE="Atlas Redesign Client Review"
+SEED_SHARE_PATH="/01-Projects/Atlas-Redesign"
+SEED_USERS=("ava.chen" "noah.patel" "mila.rossi")
+
+cmd_seed() {
+    docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1 \
+        || { echo "ERROR: container ${CONTAINER_NAME} does not exist. Run 'deploy' first."; exit 1; }
+
+    # Stop the server first: the sqlite database, the index and the file tree
+    # are all rewritten below, and a running writer would race the CLI.
+    if running; then
+        echo "==> Stopping the app to install the seed data set..."
+        docker stop "${CONTAINER_NAME}" >/dev/null
+    fi
+
+    echo "==> Writing the shared-drive tree, fixed mtimes and seed users..."
+    docker run --rm -i \
+        $(labels) \
+        --user 1000:1000 \
+        -v "${DATA_VOLUME}:/data" \
+        --entrypoint sh \
+        "${IMAGE_NAME}" -s <<'SEED' || { echo "ERROR: seeding failed."; exit 1; }
+set -e
+cd /home/filebrowser
+
+# Seed replaces every piece of mutable state: files, index, thumbnails and the
+# sqlite database (users, shares, activity). The admin is recreated from
+# config.yaml on the next boot, so a re-seed always yields the same visible state.
+rm -rf /data/files/* /data/files/.[!.]* 2>/dev/null || true
+rm -rf /data/cache/sql /data/cache/thumbnails /data/cache/downloads /data/cache/heic
+rm -f /data/database.sqlite /data/database.sqlite-shm /data/database.sqlite-wal
+
+mkdir -p \
+  /data/files/01-Projects/Atlas-Redesign/assets \
+  /data/files/01-Projects/Beacon-Mobile-App/screenshots \
+  /data/files/01-Projects/Cedar-Portal-Migration \
+  /data/files/02-Finance/2026-Q1 \
+  /data/files/02-Finance/2026-Q2 \
+  /data/files/02-Finance/Vendor-Contracts \
+  /data/files/03-Operations/Policies \
+  /data/files/03-Operations/Meeting-Notes \
+  /data/files/04-Marketing/Campaign-Q3-Launch \
+  /data/files/04-Marketing/Brand \
+  /data/files/Archive/2025-Projects
+
+cat > /data/files/README.md <<'EOF'
+# Halcyon Studio Shared Drive
+
+Working files for the studio, grouped by area.
+
+- 01-Projects: client engagements and project documents
+- 02-Finance: quarterly books, invoices and vendor contracts
+- 03-Operations: studio policies and meeting notes
+- 04-Marketing: campaign planning and brand assets
+- Archive: closed work kept for reference
+
+Drive owner: admin. Questions: ava.chen.
+EOF
+
+cat > /data/files/team-roster.csv <<'EOF'
+name,username,role,location,status
+Ava Chen,ava.chen,Creative Director,Portland,active
+Noah Patel,noah.patel,Design Lead,Remote,active
+Mila Rossi,mila.rossi,Finance Manager,Portland,active
+EOF
+
+printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAGAAAAA8CAIAAAAWtijjAAAAbklEQVR42u3QMQ0AIAwAsIlBAirmXwEXJxLmYOfC0aQKGmsnjVAgSJAgQYIECRKEIEGCBH0XdO6jIUiQIEGCBAkSJAhBggQJEiRIkCAECRIkSJAgQYIQJEiQIEGCBAkShCBBggQJEiRIEIIECRpTm05d73sQTHIAAAAASUVORK5CYII=' \
+  | base64 -d > /data/files/office-floor-plan.png
+
+cat > /data/files/01-Projects/Atlas-Redesign/brief.md <<'EOF'
+# Atlas Redesign
+
+Client: Atlas Outfitters. Engagement runs Jul-Nov 2026.
+
+Deliverables: brand refresh, storefront IA, and a component library for the
+e-commerce replatform. Weekly review is Thursday 15:00 with the client
+marketing team.
+EOF
+
+cat > /data/files/01-Projects/Atlas-Redesign/budget.csv <<'EOF'
+phase,estimate_hours,billed_hours,status
+Discovery,120,118,complete
+Brand concepts,180,175,complete
+Storefront IA,140,96,in-progress
+Component library,220,0,planned
+EOF
+
+printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAGAAAAA8CAIAAAAWtijjAAAAbUlEQVR42u3QMQ0AIAwAsDnAGBImGTPcPHOwc+FoUgWNtZNGKBAkSJAgQYIECUKQIEGCvgs679IQJEiQIEGCBAkShCBBggQJEiRIEIIECRIkSJAgQQgSJEiQIEGCBAlCkCBBggQJEiQIQYIEjSlBiqmv4FMvYgAAAABJRU5ErkJggg==' \
+  | base64 -d > /data/files/01-Projects/Atlas-Redesign/assets/atlas-hero.png
+printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAVUlEQVR42u3PQQkAMAwEsDqomnmbwwnqf1THQSAGUvd0tBIQEBAQEBAQEAgO/HnRBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEYizwtpAdcoon8wAAAABJRU5ErkJggg==' \
+  | base64 -d > /data/files/01-Projects/Atlas-Redesign/assets/atlas-logo.png
+
+cat > /data/files/01-Projects/Beacon-Mobile-App/release-checklist.md <<'EOF'
+# Beacon Mobile App - Release Checklist
+
+- [x] Crash-free session rate above 99.5% on the beta ring
+- [x] Offline queue replay tested on iOS 18 and Android 15
+- [ ] Store screenshots refreshed for the 2.4 release
+- [ ] Release notes reviewed by Noah
+EOF
+
+cat > /data/files/01-Projects/Beacon-Mobile-App/api-endpoints.json <<'EOF'
+{
+  "service": "beacon-api",
+  "environment": "staging",
+  "endpoints": [
+    { "method": "GET", "path": "/v2/trips", "auth": "bearer" },
+    { "method": "POST", "path": "/v2/trips/{id}/checkpoints", "auth": "bearer" },
+    { "method": "GET", "path": "/v2/health", "auth": "none" }
+  ]
+}
+EOF
+
+printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAGAAAAA8CAIAAAAWtijjAAAAbUlEQVR42u3QMQ0AIAwAsH0YwNH8n8hAA3Owc+FoUgWN3ItGKBAkSJAgQYIECUKQIEGCvgt699AQJEiQIEGCBAkShCBBggQJEiRIEIIECRIkSJAgQQgSJEiQIEGCBAlCkCBBggQJEiQIQYIEjSlwTXGgjosP4gAAAABJRU5ErkJggg==' \
+  | base64 -d > /data/files/01-Projects/Beacon-Mobile-App/screenshots/beacon-login.png
+
+cat > /data/files/01-Projects/Cedar-Portal-Migration/scope.md <<'EOF'
+# Cedar Portal Migration
+
+Move the Cedar partner portal from the legacy CMS to the shared component
+library. Scope covers content audit, redirect map and the 2026-Q1 cutover.
+EOF
+
+cat > '/data/files/01-Projects/Q2 Client Kickoff Notes.md' <<'EOF'
+# Q2 Client Kickoff Notes
+
+Attendees: Ava Chen, Noah Patel, Atlas Outfitters marketing.
+
+Agreed schedule for the Atlas redesign, and a follow-up on the Beacon store
+listing copy before the next studio sync.
+EOF
+
+cat > /data/files/02-Finance/2026-Q1/invoices.csv <<'EOF'
+invoice,client,issued,amount,status
+INV-2026-011,Atlas Outfitters,2026-01-31,18400.00,paid
+INV-2026-014,Beacon Logistics,2026-02-28,12750.00,paid
+INV-2026-019,Cedar Health,2026-03-31,9600.00,paid
+EOF
+
+cat > /data/files/02-Finance/2026-Q1/budget-vs-actual.csv <<'EOF'
+category,budget,actual,variance
+Studio rent,27000,27000,0
+Contractors,42000,38950,-3050
+Software,6400,6120,-280
+Marketing,15000,16480,1480
+EOF
+
+cat > /data/files/02-Finance/2026-Q2/invoices.csv <<'EOF'
+invoice,client,issued,amount,status
+INV-2026-024,Atlas Outfitters,2026-04-30,21300.00,paid
+INV-2026-031,Beacon Logistics,2026-05-31,11200.00,overdue
+INV-2026-036,Cedar Health,2026-06-30,8800.00,sent
+EOF
+
+cat > /data/files/02-Finance/Vendor-Contracts/printing-services-contract.md <<'EOF'
+# Printing Services Contract
+
+Vendor: Rose City Print. Term: 2026-01-01 to 2026-12-31.
+
+Net 30, 5% volume discount above 500 units. Renewal review each November.
+EOF
+
+cat > /data/files/03-Operations/Policies/remote-work-policy.md <<'EOF'
+# Remote Work Policy
+
+Studio members may work remotely two days per week with a shared calendar
+entry. Client workshops and the Thursday review stay in-person.
+EOF
+
+cat > /data/files/03-Operations/Policies/equipment-request-policy.md <<'EOF'
+# Equipment Request Policy
+
+Requests under 500 USD need a team lead approval; larger purchases go through
+the quarterly budget review with Mila.
+EOF
+
+cat > /data/files/03-Operations/Meeting-Notes/2026-08-14-studio-sync.md <<'EOF'
+# Studio Sync - 2026-08-14
+
+- Atlas brand concepts signed off by the client.
+- Beacon 2.4 release moves to the week of 2026-09-21.
+- Office move checklist owned by Ava.
+EOF
+
+cat > /data/files/03-Operations/Meeting-Notes/2026-09-02-client-kickoff.md <<'EOF'
+# Atlas Client Kickoff - 2026-09-02
+
+Walked through the storefront information architecture. Client asked for a
+second navigation option before the component library starts.
+EOF
+
+cat > /data/files/04-Marketing/Campaign-Q3-Launch/campaign-brief.md <<'EOF'
+# Q3 Launch Campaign Brief
+
+Goal: 12% lift in storefront sessions for the Atlas replatform launch.
+
+Audience: existing outdoor customers plus the Beacon referral list. Launch
+week is 2026-09-28.
+EOF
+
+cat > /data/files/04-Marketing/Campaign-Q3-Launch/channel-plan.csv <<'EOF'
+channel,owner,budget,start,end
+Email,ava.chen,2500,2026-09-21,2026-10-02
+Paid search,noah.patel,6000,2026-09-28,2026-10-26
+Partner newsletter,mila.rossi,1200,2026-09-28,2026-10-09
+EOF
+
+cat > /data/files/04-Marketing/Brand/brand-guidelines.md <<'EOF'
+# Brand Guidelines
+
+Primary typeface is Söhne, fallback Inter. Logo clear space equals the height
+of the mark. Approved palettes: studio blue, sand and graphite.
+EOF
+
+cat > /data/files/Archive/2025-Projects/legacy-site-refresh.md <<'EOF'
+# Legacy Site Refresh (2025)
+
+Closed engagement: refreshed the marketing site for Cedar Health. Kept for
+reference on the redirect map and the old component inventory.
+EOF
+
+# Fixed mtimes keep the Modified column and date sorting stable across resets.
+# `touch -t` (YYYYMMDDhhmm) is portable across busybox and coreutils.
+while IFS=' ' read -r stamp path; do
+  touch -t "${stamp}" "/data/files/${path}"
+done <<'MTIME'
+202609180855 README.md
+202609051230 team-roster.csv
+202604220920 office-floor-plan.png
+202608140930 01-Projects/Atlas-Redesign/brief.md
+202608191200 01-Projects/Atlas-Redesign/budget.csv
+202609011015 01-Projects/Atlas-Redesign/assets/atlas-hero.png
+202609011016 01-Projects/Atlas-Redesign/assets/atlas-logo.png
+202609241430 01-Projects/Beacon-Mobile-App/release-checklist.md
+202609221705 01-Projects/Beacon-Mobile-App/api-endpoints.json
+202609181140 01-Projects/Beacon-Mobile-App/screenshots/beacon-login.png
+202608280900 01-Projects/Cedar-Portal-Migration/scope.md
+202609021125 01-Projects/Q2 Client Kickoff Notes.md
+202607021645 02-Finance/2026-Q1/invoices.csv
+202607021650 02-Finance/2026-Q1/budget-vs-actual.csv
+202610061020 02-Finance/2026-Q2/invoices.csv
+202610081500 02-Finance/Vendor-Contracts/printing-services-contract.md
+202608051000 03-Operations/Policies/remote-work-policy.md
+202607211530 03-Operations/Policies/equipment-request-policy.md
+202608141740 03-Operations/Meeting-Notes/2026-08-14-studio-sync.md
+202609021120 03-Operations/Meeting-Notes/2026-09-02-client-kickoff.md
+202609100945 04-Marketing/Campaign-Q3-Launch/campaign-brief.md
+202609121310 04-Marketing/Campaign-Q3-Launch/channel-plan.csv
+202605281600 04-Marketing/Brand/brand-guidelines.md
+202606030915 Archive/2025-Projects/legacy-site-refresh.md
+MTIME
+
+# Standard users are created with the app's own CLI, which opens the same
+# sqlite database the server uses. Done before boot, so no concurrent writer.
+./filebrowser user set ava.chen --password tester-env-user
+echo
+./filebrowser user set noah.patel --password tester-env-user
+echo
+./filebrowser user set mila.rossi --password tester-env-user
+echo
+SEED
+
+    # The index scans on boot (and then only every >=5 min), so start the
+    # container to index the freshly seeded tree instead of waiting for the
+    # next scheduled scan.
+    echo "==> Starting the app to index the seeded tree..."
+    docker start "${CONTAINER_NAME}" >/dev/null
+    cmd_wait_ready
+
+    echo "==> Creating the client-review share..."
+    local token
+    token="$(api_login)"
+    curl -fsS -o /dev/null -X POST "http://localhost:${PORT}/api/share" \
+        -H "Authorization: Bearer ${token}" \
+        -H 'Content-Type: application/json' \
+        -d "{\"path\":\"${SEED_SHARE_PATH}\",\"source\":\"files\",\"shareType\":\"normal\",\"title\":\"${SEED_SHARE_TITLE}\"}" \
+        || { echo "ERROR: share creation failed."; exit 1; }
+
+    local files
+    files="$(docker exec "${CONTAINER_NAME}" sh -c 'find /data/files -type f | wc -l')"
+    echo "==> Seed complete: ${files} files under /data/files, users ${SEED_USERS[*]}, share '${SEED_SHARE_TITLE}'."
+    echo "==> Seed ready."
+}
+
+cmd_verify() {
+    echo "==> Verifying running state..."
+
+    curl -fsS "http://localhost:${PORT}/health" | grep -q '"ok"' \
+        || { echo "ERROR: /health is not ok."; exit 1; }
+
+    local token
+    token="$(api_login)" || { echo "ERROR: login as ${ADMIN_USER} failed."; exit 1; }
+    [[ -n "${token}" ]] || { echo "ERROR: login returned an empty token."; exit 1; }
+
+    # The SPA must come from internal/web/dist. A blank embed build yields an
+    # index without the built asset files.
+    local index_html asset
+    index_html="$(curl -fsS "http://localhost:${PORT}/")" \
+        || { echo "ERROR: UI index not reachable."; exit 1; }
+    echo "${index_html}" | grep -q '<div id="app"' \
+        || { echo "ERROR: UI index has no app mount point."; exit 1; }
+    asset="$(echo "${index_html}" | grep -oE '/public/static/[^"]+\.(js|css)' | head -1)"
+    [[ -n "${asset}" ]] || { echo "ERROR: UI index references no built assets."; exit 1; }
+    curl -fsS -o /dev/null "http://localhost:${PORT}${asset}" \
+        || { echo "ERROR: UI asset ${asset} is not served."; exit 1; }
+
+    local me
+    me="$(curl -fsS -H "Authorization: Bearer ${token}" \
+        "http://localhost:${PORT}/api/users?username=self")" \
+        || { echo "ERROR: /api/users is not reachable with the login token."; exit 1; }
+    echo "${me}" | jq -e --arg u "${ADMIN_USER}" '.username == $u and .permissions.admin == true' >/dev/null \
+        || { echo "ERROR: logged-in user is not the admin."; exit 1; }
+
+    echo "==> Waiting for the seeded listing (indexing is asynchronous)..."
+    local listing i ok=""
+    local want_folders="01-Projects 02-Finance 03-Operations 04-Marketing Archive"
+    local want_files="README.md office-floor-plan.png team-roster.csv"
+    for i in $(seq 1 30); do
+        listing="$(curl -fsS -H "Authorization: Bearer ${token}" \
+            "http://localhost:${PORT}/api/resources?path=/&source=files" 2>/dev/null || true)"
+        if [[ -n "${listing}" ]] \
+            && [[ "$(echo "${listing}" | jq -r '[.folders[]?.name]|sort|join(" ")')" == "${want_folders}" ]] \
+            && [[ "$(echo "${listing}" | jq -r '[.files[]?.name]|sort|join(" ")')" == "${want_files}" ]]; then
+            ok=1
+            break
+        fi
+        sleep 2
+    done
+    if [[ -z "${ok}" ]]; then
+        echo "ERROR: the seeded root listing is not visible."
+        echo "       Expected folders: ${want_folders}"
+        echo "       Expected files:   ${want_files}"
+        echo "       Run 'seed' first and check the container logs."
+        exit 1
+    fi
+
+    local projects
+    projects="$(curl -fsS -H "Authorization: Bearer ${token}" \
+        "http://localhost:${PORT}/api/resources?path=/01-Projects&source=files")"
+    [[ "$(echo "${projects}" | jq -r '[.folders[]?.name]|sort|join(" ")')" == "Atlas-Redesign Beacon-Mobile-App Cedar-Portal-Migration" ]] \
+        || { echo "ERROR: 01-Projects folders are not the seeded projects."; exit 1; }
+    [[ "$(echo "${projects}" | jq -r '[.files[]?.name]|sort|join(" ")')" == "Q2 Client Kickoff Notes.md" ]] \
+        || { echo "ERROR: 01-Projects file list is not the seeded one."; exit 1; }
+
+    local counts
+    counts="$(docker exec "${CONTAINER_NAME}" sh -c \
+        'printf "%s %s" "$(find /data/files -type f | wc -l)" "$(find /data/files -mindepth 1 -type d | wc -l)"')"
+    [[ "${counts}" == "24 18" ]] \
+        || { echo "ERROR: expected 24 files / 18 folders under /data/files, got '${counts}'."; exit 1; }
+
+    local users
+    users="$(curl -fsS -H "Authorization: Bearer ${token}" "http://localhost:${PORT}/api/users" \
+        | jq -r '[.[].username]|sort|join(" ")')"
+    [[ "${users}" == "admin ava.chen mila.rossi noah.patel" ]] \
+        || { echo "ERROR: seeded users missing, got '${users}'."; exit 1; }
+
+    # The seeded standard-user credentials must actually log in.
+    curl -fsS -o /dev/null -X POST \
+        "http://localhost:${PORT}/api/auth/login?username=ava.chen" \
+        -H "X-Password: tester-env-user" \
+        || { echo "ERROR: seeded user ava.chen cannot log in."; exit 1; }
+
+    local shares
+    shares="$(curl -fsS -H "Authorization: Bearer ${token}" "http://localhost:${PORT}/api/share/list")"
+    [[ "$(echo "${shares}" | jq 'length')" == "1" ]] \
+        || { echo "ERROR: expected exactly one seeded share, got '${shares}'."; exit 1; }
+    echo "${shares}" | jq -e --arg t "${SEED_SHARE_TITLE}" --arg p "${SEED_SHARE_PATH}" \
+        '.[0].title == $t and .[0].path == $p' >/dev/null \
+        || { echo "ERROR: the seeded share is not the expected title/path."; exit 1; }
+
+    # Informational: stable hash of the seeded tree (relative path, mtime, content).
+    local fingerprint
+    fingerprint="$(docker exec "${CONTAINER_NAME}" sh -c \
+        'cd /data/files && find . -type f | sort | while IFS= read -r f; do printf "%s %s %s\n" "$f" "$(stat -c %Y "$f")" "$(sha256sum <"$f")"; done | sha256sum' \
+        | cut -d" " -f1)"
+
+    echo "==> Verification complete: health, login, SPA dist assets, admin user,"
+    echo "    seed tree (24 files / 18 folders), users and share."
+    echo "==> seed fingerprint (name+mtime+content): ${fingerprint}"
+}
+
+cmd_reset_inner() {
+    docker stop "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker rm "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker volume rm "${DATA_VOLUME}" >/dev/null 2>&1 || true
+}
+
+cmd_reset() {
+    echo "==> Resetting environment (container + sqlite/files volume: clean slate)..."
+    cmd_reset_inner
+    echo "==> Reset complete. Run 'deploy' to start fresh."
+}
+
+cmd_stop() {
+    echo "==> Stopping container (data volume preserved)..."
+    docker stop "${CONTAINER_NAME}" >/dev/null 2>&1 || echo "==> Container not running."
+    echo "==> Stopped."
+}
+
+cmd_logs() {
+    docker logs -f "${CONTAINER_NAME}" 2>/dev/null || echo "Container not running."
+}
+
+cmd_status() {
+    if running; then
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}"
+        echo "Browser origin: ${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Image: $(docker inspect -f '{{.Config.Image}}' "${CONTAINER_NAME}")"
+        echo "Data volume: ${DATA_VOLUME} (sqlite: /data/database.sqlite, files: /data/files)"
+    else
+        echo "Status: NOT RUNNING"
+        echo "Container: ${CONTAINER_NAME}"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+filebrowser-quantum - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build image from source, start the app (fresh /data volume)
+  seed      Install the shared-drive seed: files, users and one share
+  verify    Assert health, login, SPA assets, admin, seed tree, users, share
+  reset     Stop/remove container and /data volume (keeps image)
+  stop      Stop container (keeps /data volume)
+  logs      Tail the app container logs
+  status    Show container status, URL and volume
+  help      Show this help message
+
+Options:
+  --run-id <id>     Isolate container/volume names for parallel runs.
+                    Default: default (or \$RUN_ID)
+  --port <port>     Host port mapped to container port 80.
+                    Default: 18078 (or \$PORT)
+
+Env:
+  ADMIN_USER (default admin), ADMIN_PASSWORD (default tester-env-admin)
+  IMAGE_TAG (set by scripts/rl-env; manual runs use :dev)
+  BASE_URL / TESTER_ENV_BROWSER_ORIGIN only affect the printed URL.
+
+Credentials: ${ADMIN_USER} / ${ADMIN_PASSWORD}
+Seed users: ava.chen, noah.patel, mila.rossi / tester-env-user (standard users)
+Seed share: '${SEED_SHARE_TITLE}' for ${SEED_SHARE_PATH}
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    while [[ $# -gt 0 ]]; do
+        case "${1}" in
+            --run-id) RUN_ID="${2:?--run-id requires a value}"; shift 2 ;;
+            --port) PORT="${2:?--port requires a value}"; shift 2 ;;
+            --help|-h) cmd_help; exit 0 ;;
+            *) echo "Error: unknown argument '${1}'"; cmd_help; exit 1 ;;
+        esac
+    done
+
+    BASE_URL="${BASE_URL:-${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}}"
+    refresh_names
+
+    case "${cmd}" in
+        deploy) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *) echo "Error: unknown command '${cmd}'"; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"
